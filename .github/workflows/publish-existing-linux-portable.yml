@@ -1,0 +1,43 @@
+name: Publish existing WinZapp Linux Portable
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/publish-existing-linux-portable.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: winzapp-linux-portable-test-20260831
+      ARCHIVE: WinZapp-Linux-Portable-amd64.tar.xz
+      SOURCE_BASE: https://github.com/joao465/joao/releases/download/winzapp-linux-portable-test-20260831
+    steps:
+      - name: Download already-built portable archive
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 2 -o "$ARCHIVE" "$SOURCE_BASE/$ARCHIVE"
+          curl -fL --retry 5 --retry-delay 2 -o "$ARCHIVE.sha256" "$SOURCE_BASE/$ARCHIVE.sha256"
+          sha256sum -c "$ARCHIVE.sha256"
+          ls -lh "$ARCHIVE" "$ARCHIVE.sha256"
+
+      - name: Publish complete file in this fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+              -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title 'WinZapp Linux Portable - Teste' \
+              --notes 'Versão portátil para Linux. Não instala atalhos nem adiciona entrada ao menu do GNOME. Extraia e execute ./WinZapp. Os logs ficam na mesma pasta do executável.'
+          fi
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets
