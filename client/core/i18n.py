@@ -1,5 +1,7 @@
 import json
+import locale
 import logging
+import os
 from app_paths import resource_path
 
 # Fallback used only if languages/language_map.json is missing or unreadable
@@ -35,6 +37,68 @@ LANGUAGE_NAMES = _load_language_names()
 _TRANSLATIONS_CACHE: dict = {}
 
 
+def _normalize_locale_name(value: str | None) -> str:
+    """Convert locale spellings such as pt_BR.UTF-8 into pt-BR."""
+    if not value:
+        return ""
+    value = str(value).strip()
+    if not value:
+        return ""
+    value = value.split(".", 1)[0].split("@", 1)[0].replace("_", "-")
+    if value.upper() in {"C", "POSIX"}:
+        return ""
+    parts = [part for part in value.split("-") if part]
+    if not parts:
+        return ""
+    language = parts[0].lower()
+    if len(parts) == 1:
+        return language
+    return f"{language}-{parts[1].upper()}"
+
+
+def detect_system_language() -> str:
+    """Return the closest WinZapp translation for the operating-system locale.
+
+    Linux desktop sessions normally expose the language through LC_ALL,
+    LC_MESSAGES or LANG. Exact regional translations win; if only the base
+    language matches, the first translation for that language is used.
+    """
+    candidates: list[str] = []
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = _normalize_locale_name(os.environ.get(key))
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for getter in (
+        lambda: locale.getlocale(locale.LC_MESSAGES)[0],
+        lambda: locale.getlocale()[0],
+    ):
+        try:
+            value = _normalize_locale_name(getter())
+        except Exception:
+            value = ""
+        if value and value not in candidates:
+            candidates.append(value)
+
+    supported = list(LANGUAGE_NAMES)
+    supported_lower = {code.lower(): code for code in supported}
+
+    for candidate in candidates:
+        exact = supported_lower.get(candidate.lower())
+        if exact:
+            return exact
+
+    for candidate in candidates:
+        base = candidate.split("-", 1)[0].lower()
+        for code in supported:
+            if code.split("-", 1)[0].lower() == base:
+                return code
+
+    # Keep the project's historical default if the system language has no
+    # bundled translation.
+    return "pt-BR" if "pt-BR" in LANGUAGE_NAMES else supported[0]
+
+
 def _load_translations(lang_code: str) -> dict:
     """Load the JSON file for *lang_code* into the cache and return it."""
     try:
@@ -49,11 +113,12 @@ def _load_translations(lang_code: str) -> dict:
 class I18n:
     def __init__(self, main_window):
         self.main_window = main_window
-        self.language = "pt-BR"  # default, overwritten by get_language()
+        self.language = detect_system_language()
 
     def get_language(self):
-        """Read the current language from settings and cache it in self.language."""
-        self.language = self.main_window.settings.get("general", {}).get("language", "pt-BR")
+        """Use a saved override when valid, otherwise follow the system locale."""
+        configured = self.main_window.settings.get("general", {}).get("language", "")
+        self.language = configured if configured in LANGUAGE_NAMES else detect_system_language()
         return self.language
 
     def t(self, key: str) -> str:
