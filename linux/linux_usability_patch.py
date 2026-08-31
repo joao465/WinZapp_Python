@@ -2,7 +2,7 @@
 """Linux-only build patch for Orca, automatic locale and short AF_UNIX IPC.
 
 The upstream WinZapp UI contains Windows-specific accessibility helpers and a
-first-run language chooser.  The Linux portable build should instead use
+first-run language chooser. The Linux portable build should instead use
 native GTK/AT-SPI semantics, follow the desktop locale automatically and keep
 its Unix-domain socket below Linux's sun_path length limit.
 """
@@ -83,19 +83,23 @@ def patch_conversations(path: Path) -> None:
         "in-conversation search accessible name",
     )
 
-    old_mode = '''        if message_list_mode == "dataview":
-            message_list_mode = "listbox"
-        self._message_list_mode = message_list_mode
-'''
-    new_mode = '''        if message_list_mode == "dataview":
-            message_list_mode = "listbox"
-        # Linux/Orca: prefer the simpler GTK-backed compatibility list. It
-        # exposes rows more predictably through AT-SPI than wx.ListCtrl.
-        if sys.platform != "win32":
-            message_list_mode = "listbox"
-        self._message_list_mode = message_list_mode
-'''
-    text = replace_once(text, old_mode, new_mode, "Linux message-list mode")
+    # Do not depend on the exact formatting of the preceding dataview fallback.
+    # The Linux accessibility patch may alter nearby lines before this patch runs.
+    # The assignment itself is stable and is the only point that needs overriding.
+    mode_assignment = '        self._message_list_mode = message_list_mode\n'
+    linux_mode_assignment = (
+        '        # Linux/Orca: prefer the simpler GTK-backed compatibility list.\n'
+        '        # It exposes rows more predictably through AT-SPI than wx.ListCtrl.\n'
+        '        if sys.platform != "win32":\n'
+        '            message_list_mode = "listbox"\n'
+        '        self._message_list_mode = message_list_mode\n'
+    )
+    text = replace_once(
+        text,
+        mode_assignment,
+        linux_mode_assignment,
+        "message-list mode assignment",
+    )
 
     text = replace_once(
         text,
