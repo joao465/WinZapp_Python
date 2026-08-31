@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - 'linux/fix_sound_lib_linux.py'
+      - 'linux/linux_usability_patch.py'
+      - 'client/core/i18n.py'
       - '.github/workflows/build-linux-portable.yml'
 
 permissions:
@@ -46,7 +48,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             git ca-certificates curl xz-utils file binutils patchelf \
-            python3 python3-dev python3-venv python3-pip python3-wxgtk4.0 python3-pyaudio \
+            python3 python3-dev python3-venv python3-pip python3-wxgtk4.0 python3-pyaudio python3-speechd \
             build-essential pkg-config portaudio19-dev libsndfile1-dev libasound2-dev \
             libgtk-3-dev libglib2.0-dev libnotify-dev libdbus-1-dev \
             libnss3 libgbm1 libx11-6 libx11-xcb1 libxss1 libxkbcommon0 \
@@ -76,9 +78,14 @@ jobs:
               1,
           )
 
-          # Preserve the GTK accessibility fix used by the working Linux build.
+          # Preserve the GTK accessibility fix used by the working Linux build,
+          # then add Linux-native Orca names, automatic locale and short IPC.
           needle = 'python3 "$PATCHER" "$SRC"\n'
-          repl = needle + 'python3 "$ROOT/_linux_helper/winzapp-linux/linux_accessibility_patch.py" "$SRC"\n'
+          repl = (
+              needle
+              + 'python3 "$ROOT/_linux_helper/winzapp-linux/linux_accessibility_patch.py" "$SRC"\n'
+              + 'python3 "$ROOT/linux/linux_usability_patch.py" "$SRC"\n'
+          )
           if needle not in s:
               raise SystemExit('phase1 invocation not found')
           s = s.replace(needle, repl, 1)
@@ -98,13 +105,21 @@ jobs:
           s = s.replace(marker, inserted, 1)
 
           # Patch sound-lib 0.83 after requirements are installed. This removes
-          # its Linux device -1 -> 1 rewrite so BASS opens the PipeWire/ALSA
-          # system default device instead of a busy/raw hardware device.
+          # its Linux device -1 -> 1 rewrite and adds robust BASS fallbacks.
           install_line = '"$VENV/bin/python" -m pip install -r "$SRC/requirements.txt"\n'
           audio_fix = install_line + '"$VENV/bin/python" "$ROOT/linux/fix_sound_lib_linux.py"\n'
           if install_line not in s:
               raise SystemExit('requirements install line not found')
           s = s.replace(install_line, audio_fix, 1)
+
+          # accessible_output2 loads Speech Dispatcher dynamically. Bundle the
+          # Python client explicitly so Orca-related WinZapp announcements work
+          # from the portable executable instead of depending on host Python.
+          old_hidden = '  --hidden-import wx.adv --hidden-import socketio --hidden-import engineio --hidden-import pyaudio \\\n'
+          new_hidden = '  --hidden-import wx.adv --hidden-import socketio --hidden-import engineio --hidden-import pyaudio --hidden-import speechd --hidden-import speechd.client \\\n'
+          if old_hidden not in s:
+              raise SystemExit('PyInstaller hidden-import line not found')
+          s = s.replace(old_hidden, new_hidden, 1)
 
           p.write_text(s, encoding='utf-8')
           PY
@@ -134,9 +149,13 @@ jobs:
           Execute diretamente o arquivo: ./WinZapp
           Esta versão não instala atalhos e não adiciona nada ao menu de aplicativos.
 
-          Correção desta build:
-          - BASS usa o dispositivo de saída padrão real do Linux/PipeWire (device -1).
-          - Não força mais o dispositivo 1 do sound-lib no Linux.
+          Correções desta build:
+          - BASS usa saídas Linux com fallback seguro.
+          - O idioma inicial é detectado automaticamente pelo sistema.
+          - Controles principais recebem nomes nativos GTK/AT-SPI para o Orca.
+          - A lista de mensagens usa o modo mais simples no Linux.
+          - O cliente Python do Speech Dispatcher é incluído no executável.
+          - O socket IPC usa um caminho curto em XDG_RUNTIME_DIR ou /tmp.
 
           Os logs são gravados nesta mesma pasta:
           - session-AAAAmmdd-HHMMSS.log
@@ -161,16 +180,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          NOTES='Portátil Linux com melhorias de Orca/GTK/AT-SPI, idioma automático do sistema, Speech Dispatcher empacotado, IPC Unix corrigido e fallback de áudio. Não instala atalhos nem adiciona entrada ao menu do GNOME. Extraia e execute ./WinZapp. Os logs ficam na mesma pasta do executável.'
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" -R "$GITHUB_REPOSITORY" --clobber
             gh release edit "$TAG" -R "$GITHUB_REPOSITORY" \
-              --title 'WinZapp Linux Portable - Teste corrigido' \
-              --notes 'Portátil Linux corrigido para usar o dispositivo de áudio padrão real do PipeWire/ALSA. Não instala atalhos nem adiciona entrada ao menu do GNOME. Extraia e execute ./WinZapp. Os logs ficam na mesma pasta do executável.'
+              --title 'WinZapp Linux Portable - Orca e idioma automático' \
+              --notes "$NOTES"
           else
             gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
               -R "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title 'WinZapp Linux Portable - Teste corrigido' \
-              --notes 'Portátil Linux corrigido para usar o dispositivo de áudio padrão real do PipeWire/ALSA. Não instala atalhos nem adiciona entrada ao menu do GNOME. Extraia e execute ./WinZapp. Os logs ficam na mesma pasta do executável.'
+              --title 'WinZapp Linux Portable - Orca e idioma automático' \
+              --notes "$NOTES"
           fi
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets
