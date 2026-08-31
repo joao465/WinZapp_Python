@@ -23,6 +23,8 @@ import sound_lib.output
 
 
 MARKER = "WINZAPP_LINUX_BASS_FALLBACK"
+# Rebuild trigger: Linux helper now guards wx.Accessible constructors on wxGTK
+# so post-login conversation controls rely on GTK/AT-SPI rather than MSAA.
 
 
 def main() -> int:
