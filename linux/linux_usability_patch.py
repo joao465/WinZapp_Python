@@ -1,148 +1,248 @@
 #!/usr/bin/env python3
-"""Linux-only build patch for Orca, automatic locale and short AF_UNIX IPC.
+"""Linux build-time usability patch for Orca, locale and AF_UNIX IPC.
 
-The upstream WinZapp UI contains Windows-specific accessibility helpers and a
-first-run language chooser. The Linux portable build should instead use
-native GTK/AT-SPI semantics, follow the desktop locale automatically and keep
-its Unix-domain socket below Linux's sun_path length limit.
+This patch intentionally uses Python's AST instead of matching source-code
+formatting. Another Linux accessibility patch rewrites files with ast.unparse(),
+so text/indentation-based replacements are inherently brittle.
 """
 from __future__ import annotations
 
-import re
+import ast
 import sys
 from pathlib import Path
 
 
-MARKER = "WINZAPP_LINUX_USABILITY_PATCH"
+def _import_exists(tree: ast.Module, module: str) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            if any(alias.name == module for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module == module:
+            return True
+    return False
 
 
-def replace_once(text: str, old: str, new: str, label: str) -> str:
-    if new in text:
-        return text
-    if old not in text:
-        raise SystemExit(f"Could not find {label}")
-    return text.replace(old, new, 1)
-
-
-def patch_main(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
-    if MARKER in text:
+def _ensure_import(tree: ast.Module, module: str) -> None:
+    if _import_exists(tree, module):
         return
+    insert_at = 0
+    if (
+        tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        insert_at = 1
+    while (
+        insert_at < len(tree.body)
+        and isinstance(tree.body[insert_at], ast.ImportFrom)
+        and tree.body[insert_at].module == "__future__"
+    ):
+        insert_at += 1
+    tree.body.insert(insert_at, ast.Import(names=[ast.alias(name=module)]))
 
-    pattern = re.compile(
-        r"(?ms)^    def _ensure_language_selected\(self\):\n.*?(?=^    def [A-Za-z_])"
+
+def _method_body(source: str, method_name: str) -> list[ast.stmt]:
+    wrapper = ast.parse(source)
+    fn = next(
+        node
+        for node in wrapper.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
     )
-    replacement = '''    def _ensure_language_selected(self):
-        """Linux portable: select the desktop language without a startup dialog."""
-        # WINZAPP_LINUX_USABILITY_PATCH
-        lang_already_set = self.settings.get("general", {}).get("language", "")
-        if lang_already_set:
-            return
-        from core.i18n import detect_system_language
-        lang = detect_system_language()
-        self.settings.setdefault("general", {})["language"] = lang
-        self.save_settings()
-        logging.info("[linux] detected system language: %s", lang)
-
-'''
-    text, count = pattern.subn(replacement, text, count=1)
-    if count != 1:
-        raise SystemExit(f"Could not patch _ensure_language_selected in {path}")
-
-    compile(text, str(path), "exec")
-    path.write_text(text, encoding="utf-8")
+    return fn.body
 
 
-def patch_conversations(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
+class MainTransformer(ast.NodeTransformer):
+    def __init__(self) -> None:
+        self.patched = 0
 
-    if "import sys\n" not in text:
-        text = replace_once(text, "import re\n", "import re\nimport sys\n", "conversations sys import")
-
-    text = replace_once(
-        text,
-        '        self.search_field = wx.TextCtrl(self, style=wx.TE_DONTWRAP)\n',
-        '        self.search_field = wx.TextCtrl(self, style=wx.TE_DONTWRAP)\n'
-        '        self.search_field.SetName(i18n.t("search_conversations"))\n',
-        "conversation search accessible name",
-    )
-
-    text = replace_once(
-        text,
-        '        self.conversations_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)\n',
-        '        self.conversations_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)\n'
-        '        self.conversations_list.SetName(i18n.t("conversations"))\n',
-        "conversations list accessible name",
-    )
-
-    text = replace_once(
-        text,
-        '        self._search_field = wx.TextCtrl(self._search_panel, style=wx.TE_DONTWRAP | wx.TE_PROCESS_ENTER)\n',
-        '        self._search_field = wx.TextCtrl(self._search_panel, style=wx.TE_DONTWRAP | wx.TE_PROCESS_ENTER)\n'
-        '        self._search_field.SetName(i18n.t("search_in_conv"))\n',
-        "in-conversation search accessible name",
-    )
-
-    # Do not depend on the exact formatting of the preceding dataview fallback.
-    # The Linux accessibility patch may alter nearby lines before this patch runs.
-    # The assignment itself is stable and is the only point that needs overriding.
-    mode_assignment = '        self._message_list_mode = message_list_mode\n'
-    linux_mode_assignment = (
-        '        # Linux/Orca: prefer the simpler GTK-backed compatibility list.\n'
-        '        # It exposes rows more predictably through AT-SPI than wx.ListCtrl.\n'
-        '        if sys.platform != "win32":\n'
-        '            message_list_mode = "listbox"\n'
-        '        self._message_list_mode = message_list_mode\n'
-    )
-    text = replace_once(
-        text,
-        mode_assignment,
-        linux_mode_assignment,
-        "message-list mode assignment",
-    )
-
-    text = replace_once(
-        text,
-        '        control.InsertColumn(0, label, width=360)\n',
-        '        control.InsertColumn(0, label, width=360)\n'
-        '        control.SetName(label)\n',
-        "messages list accessible name",
-    )
-
-    # The composer has no SetHint() in the current source. Name the native GTK
-    # text control immediately after its creation so Orca receives a stable
-    # accessible name through AT-SPI without relying on Windows wx.Accessible.
-    composer_creation = '''        self.message_field = wx.TextCtrl(
-            self.conversation_panel,
-            style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER | wx.TE_DONTWRAP,
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if node.name != "_ensure_language_selected":
+            return self.generic_visit(node)
+        node.body = _method_body(
+            '''
+def _template(self):
+    # Linux portable: no startup language chooser. Keep a valid explicit
+    # user override; otherwise follow the desktop locale dynamically.
+    configured = self.settings.get("general", {}).get("language", "")
+    if configured:
+        return
+    from core.i18n import detect_system_language
+    self.i18n.language = detect_system_language()
+''',
+            "_template",
         )
-'''
-    composer_named = composer_creation + '        self.message_field.SetName(i18n.t("type_message"))\n'
-    text = replace_once(
-        text,
-        composer_creation,
-        composer_named,
-        "message composer control",
+        self.patched += 1
+        return node
+
+
+def _self_attr_name(target: ast.AST) -> str | None:
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    ):
+        return target.attr
+    return None
+
+
+def _call_stmt(receiver: str, method: str, arg: ast.expr) -> ast.Expr:
+    return ast.Expr(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=receiver,
+                    ctx=ast.Load(),
+                ),
+                attr=method,
+                ctx=ast.Load(),
+            ),
+            args=[arg],
+            keywords=[],
+        )
     )
 
-    compile(text, str(path), "exec")
-    path.write_text(text, encoding="utf-8")
+
+def _i18n_t(key: str) -> ast.expr:
+    return ast.Call(
+        func=ast.Attribute(
+            value=ast.Name(id="i18n", ctx=ast.Load()),
+            attr="t",
+            ctx=ast.Load(),
+        ),
+        args=[ast.Constant(key)],
+        keywords=[],
+    )
 
 
-def patch_ipc(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
+class ConversationsTransformer(ast.NodeTransformer):
+    ACCESSIBLE_NAMES = {
+        "search_field": "search_conversations",
+        "conversations_list": "conversations",
+        "_search_field": "search_in_conv",
+        "message_field": "type_message",
+    }
 
-    old = '''def _ipc_dir(global_dir: str) -> str:
-    d = os.path.join(global_dir, "ipc")
-    os.makedirs(d, exist_ok=True)
-    return d
-'''
-    new = '''def _ipc_dir(global_dir: str) -> str:
-    # Linux AF_UNIX paths are normally limited to roughly 108 bytes. A
-    # portable WinZapp can live deep under ~/Downloads, so keeping the socket
-    # beside the application can exceed that limit. Put only the transient
-    # socket in the user's short runtime directory; persistent data remains
-    # portable beside the executable.
+    def __init__(self) -> None:
+        self._class_stack: list[str] = []
+        self._function_stack: list[str] = []
+        self.named_controls: set[str] = set()
+        self.message_mode_patched = 0
+        self.messages_list_named = 0
+
+    @property
+    def in_conversations_panel(self) -> bool:
+        return bool(self._class_stack) and self._class_stack[-1] == "ConversationsPanel"
+
+    @property
+    def current_function(self) -> str:
+        return self._function_stack[-1] if self._function_stack else ""
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self._class_stack.append(node.name)
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._class_stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._function_stack.append(node.name)
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._function_stack.pop()
+
+    def visit_Assign(self, node: ast.Assign):
+        node = self.generic_visit(node)
+        if not self.in_conversations_panel:
+            return node
+
+        if len(node.targets) != 1:
+            return node
+        attr = _self_attr_name(node.targets[0])
+
+        if self.current_function == "__init__" and attr in self.ACCESSIBLE_NAMES:
+            # Only tag assignments that actually create wx controls. This
+            # avoids touching later state assignments with the same attribute.
+            if isinstance(node.value, ast.Call):
+                extra = _call_stmt(
+                    attr,
+                    "SetName",
+                    _i18n_t(self.ACCESSIBLE_NAMES[attr]),
+                )
+                self.named_controls.add(attr)
+                return [node, ast.copy_location(extra, node)]
+
+        if (
+            self.current_function == "__init__"
+            and attr == "_message_list_mode"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "message_list_mode"
+        ):
+            linux_override = ast.If(
+                test=ast.Compare(
+                    left=ast.Attribute(
+                        value=ast.Name(id="sys", ctx=ast.Load()),
+                        attr="platform",
+                        ctx=ast.Load(),
+                    ),
+                    ops=[ast.NotEq()],
+                    comparators=[ast.Constant("win32")],
+                ),
+                body=[
+                    ast.Assign(
+                        targets=[ast.Name(id="message_list_mode", ctx=ast.Store())],
+                        value=ast.Constant("listbox"),
+                    )
+                ],
+                orelse=[],
+            )
+            self.message_mode_patched += 1
+            return [ast.copy_location(linux_override, node), node]
+
+        return node
+
+    def visit_Expr(self, node: ast.Expr):
+        node = self.generic_visit(node)
+        if (
+            self.in_conversations_panel
+            and self.current_function == "_create_messages_list_control"
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "InsertColumn"
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "control"
+        ):
+            set_name = ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="control", ctx=ast.Load()),
+                        attr="SetName",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Name(id="label", ctx=ast.Load())],
+                    keywords=[],
+                )
+            )
+            self.messages_list_named += 1
+            return [node, ast.copy_location(set_name, node)]
+        return node
+
+
+class IpcTransformer(ast.NodeTransformer):
+    def __init__(self) -> None:
+        self.patched = 0
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if node.name != "_ipc_dir":
+            return self.generic_visit(node)
+        node.body = _method_body(
+            '''
+def _template(global_dir):
+    # Keep AF_UNIX sockets under Linux's short sun_path limit while leaving
+    # persistent WinZapp data in the portable data directory.
     if os.name != "nt":
         base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
         try:
@@ -159,10 +259,43 @@ def patch_ipc(path: Path) -> None:
         except OSError:
             pass
     return d
-'''
-    text = replace_once(text, old, new, "short Linux IPC directory")
+''',
+            "_template",
+        )
+        self.patched += 1
+        return node
+
+
+def _write_tree(path: Path, tree: ast.Module) -> None:
+    ast.fix_missing_locations(tree)
+    text = ast.unparse(tree) + "\n"
     compile(text, str(path), "exec")
     path.write_text(text, encoding="utf-8")
+
+
+def patch_main(path: Path) -> int:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tx = MainTransformer()
+    tree = tx.visit(tree)
+    _write_tree(path, tree)
+    return tx.patched
+
+
+def patch_conversations(path: Path) -> ConversationsTransformer:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    _ensure_import(tree, "sys")
+    tx = ConversationsTransformer()
+    tree = tx.visit(tree)
+    _write_tree(path, tree)
+    return tx
+
+
+def patch_ipc(path: Path) -> int:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tx = IpcTransformer()
+    tree = tx.visit(tree)
+    _write_tree(path, tree)
+    return tx.patched
 
 
 def main() -> int:
@@ -176,14 +309,46 @@ def main() -> int:
         print(f"client directory not found: {client}", file=sys.stderr)
         return 2
 
-    patch_main(client / "main.py")
-    patch_conversations(client / "ui" / "conversations.py")
-    patch_ipc(client / "ipc.py")
+    main_count = patch_main(client / "main.py")
+    conv = patch_conversations(client / "ui" / "conversations.py")
+    ipc_count = patch_ipc(client / "ipc.py")
 
-    print("Linux usability patch applied:")
-    print("  - automatic system language on first launch")
-    print("  - Orca-friendly native names and message list")
-    print("  - short AF_UNIX IPC runtime path")
+    # i18n itself is committed in the fork; compile it here as a build guard.
+    i18n_path = client / "core" / "i18n.py"
+    compile(i18n_path.read_text(encoding="utf-8"), str(i18n_path), "exec")
+
+    print("Linux usability AST patch applied:")
+    print(f"  - language chooser methods patched: {main_count}")
+    print(f"  - named Orca controls: {sorted(conv.named_controls)}")
+    print(f"  - Linux message-list overrides: {conv.message_mode_patched}")
+    print(f"  - messages-list accessible names: {conv.messages_list_named}")
+    print(f"  - short AF_UNIX IPC functions patched: {ipc_count}")
+
+    # These diagnostics are intentionally warnings rather than hard failures.
+    # If upstream moves a non-critical UI control, the portable build should
+    # still complete and remain testable instead of failing on source layout.
+    expected = set(ConversationsTransformer.ACCESSIBLE_NAMES)
+    missing = sorted(expected - conv.named_controls)
+    if main_count == 0:
+        print(
+            "WARNING: _ensure_language_selected was not found; i18n still uses "
+            "system locale when no override is saved."
+        )
+    if missing:
+        print(f"WARNING: optional Orca names not found: {missing}")
+    if conv.message_mode_patched == 0:
+        print(
+            "WARNING: message-list mode assignment not found; leaving upstream "
+            "mode unchanged."
+        )
+    if conv.messages_list_named == 0:
+        print(
+            "WARNING: message-list InsertColumn not found; native GTK role "
+            "remains available."
+        )
+    if ipc_count == 0:
+        print("WARNING: _ipc_dir not found; leaving upstream IPC path unchanged.")
+
     return 0
 
 
