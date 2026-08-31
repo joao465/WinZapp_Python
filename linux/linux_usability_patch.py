@@ -62,13 +62,10 @@ class MainTransformer(ast.NodeTransformer):
         node.body = _method_body(
             '''
 def _template(self):
-    # Linux portable: no startup language chooser. Keep a valid explicit
-    # user override; otherwise follow the desktop locale dynamically.
-    configured = self.settings.get("general", {}).get("language", "")
-    if configured:
-        return
-    from core.i18n import detect_system_language
-    self.i18n.language = detect_system_language()
+    # Linux portable: do not show the startup language chooser here.
+    # MainWindow calls this before self.i18n exists. I18n is constructed later
+    # and already detects the system locale when there is no valid saved override.
+    return
 ''',
             "_template",
         )
