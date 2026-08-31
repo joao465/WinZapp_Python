@@ -109,12 +109,20 @@ def patch_conversations(path: Path) -> None:
         "messages list accessible name",
     )
 
+    # The composer has no SetHint() in the current source. Name the native GTK
+    # text control immediately after its creation so Orca receives a stable
+    # accessible name through AT-SPI without relying on Windows wx.Accessible.
+    composer_creation = '''        self.message_field = wx.TextCtrl(
+            self.conversation_panel,
+            style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER | wx.TE_DONTWRAP,
+        )
+'''
+    composer_named = composer_creation + '        self.message_field.SetName(i18n.t("type_message"))\n'
     text = replace_once(
         text,
-        '        self.message_field.SetHint(i18n.t("type_message"))\n',
-        '        self.message_field.SetHint(i18n.t("type_message"))\n'
-        '        self.message_field.SetName(i18n.t("type_message"))\n',
-        "message composer accessible name",
+        composer_creation,
+        composer_named,
+        "message composer control",
     )
 
     compile(text, str(path), "exec")
